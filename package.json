@@ -28,7 +28,8 @@
 		"src",
 		"docs",
 		"README.md",
-		"LICENSE"
+		"LICENSE",
+		"CHANGELOG.md"
 	],
 	"pi": {
 		"extensions": [
