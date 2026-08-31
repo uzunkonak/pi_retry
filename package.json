@@ -1,0 +1,48 @@
+{
+	"name": "pi_retry",
+	"version": "0.1.0",
+	"description": "Pi extension that waits out provider rate limits and resumes the interrupted run once the limit window resets",
+	"type": "module",
+	"license": "MIT",
+	"author": "Caner Uzunkonak",
+	"homepage": "https://github.com/uzunkonak/pi_retry#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/uzunkonak/pi_retry.git"
+	},
+	"bugs": {
+		"url": "https://github.com/uzunkonak/pi_retry/issues"
+	},
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"rate-limit",
+		"retry",
+		"429"
+	],
+	"files": [
+		"extensions",
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"extensions/retry-limit.ts"
+		]
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"scripts": {
+		"check": "tsc -p tsconfig.json && npm test",
+		"test": "node --test \"test/*.test.ts\"",
+		"test:e2e": "node test/e2e.mjs",
+		"typecheck": "tsc -p tsconfig.json"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@types/node": "^24.0.0",
+		"typescript": "^5.9.3"
+	}
+}
