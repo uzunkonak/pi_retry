@@ -11,14 +11,14 @@ sleeps with a live countdown, and restarts the agent from where it stopped.
 ## Install
 
 ```bash
-pi install npm:pi_retry
+pi install npm:@uzunkonak/pi_retry
 ```
 
 Or install from git, or try it for a single run without installing at all:
 
 ```bash
 pi install git:github.com/uzunkonak/pi_retry
-pi -e npm:pi_retry
+pi -e npm:@uzunkonak/pi_retry
 ```
 
 ## Use

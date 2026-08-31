@@ -1,5 +1,5 @@
 {
-	"name": "pi_retry",
+	"name": "@uzunkonak/pi_retry",
 	"version": "0.1.0",
 	"description": "Pi extension that waits out provider rate limits and resumes the interrupted run once the limit window resets",
 	"type": "module",
