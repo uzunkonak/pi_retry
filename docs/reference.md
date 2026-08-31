@@ -18,13 +18,15 @@ restarts the agent from where it stopped.
 ## Install
 
 ```bash
-pi install /path/to/pi_retry          # local checkout
-pi install git:github.com/uzunkonak/pi_retry
+pi install npm:pi_retry                       # published package
+pi install git:github.com/uzunkonak/pi_retry  # straight from the repo
+pi install /path/to/pi_retry                  # local checkout
 ```
 
 Or try it for one run without installing:
 
 ```bash
+pi -e npm:pi_retry
 pi -e /path/to/pi_retry/extensions/retry-limit.ts
 ```
 
