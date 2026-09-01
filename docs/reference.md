@@ -40,7 +40,8 @@ run ends on an error
       │
       ├─ find the reset time
       │     1. rate-limit response headers  (retry-after, *-ratelimit-*-reset)
-      │     2. the provider's error prose   ("try again in 4m12s", "resets at 3:00 PM")
+      │     2. the provider's error prose   ("try again in ~109 min",
+      │                                      "resets 11:30pm (Europe/Istanbul)")
       │     3. blind fallback               (60s, escalating to 15m)
       │
       ├─ sleep with a countdown ──── Esc / /retry-limit cancel ─► give up
@@ -53,6 +54,14 @@ run ends on an error
 Exhausted credit or billing quota needs a human, so the extension stops and says so rather than
 sleeping until the end of the month. Set `retryOnQuotaExhausted` if you want it to wait anyway.
 
+**Subscription wording.** Consumer plans rarely say "rate limit". ChatGPT/Codex reports
+`You have hit your ChatGPT usage limit (plus plan). Try again in ~109 min.` or
+`You've hit your session limit · resets 11:30pm (Europe/Istanbul)`, and Claude says
+`Your limit will reset at 3pm (Europe/Istanbul)`. All of these are recognised: hedged delays
+(`~`, `about`, `roughly`), preposition-less resets (`resets 11:30pm`), hour-only clock times
+(`3pm`), and a trailing IANA timezone, which is resolved properly instead of being read as
+local time. A wall-clock time that has already passed today is taken as tomorrow's occurrence.
+
 **Recovering the reset headers.** `retry-after` is the most precise signal there is, but pi's
 `after_provider_response` hook never sees it: the Anthropic and OpenAI SDKs throw on a 429
 before a response object reaches pi, so the hook only fires on success. To get those headers
@@ -61,9 +70,21 @@ status and headers of limit-shaped responses (429/402/403/529) and changes nothi
 response is returned untouched and its body is never consumed. Turn it off with
 `observeResponses: false` and the extension falls back to parsing the error text.
 
-**Blocking on purpose.** The wait happens inside pi's `agent_settled` hook, which pi awaits as
-part of the prompt call. That keeps `pi -p` runs and RPC callers alive for the whole wait
-instead of letting them exit on the rate-limit error.
+**Where the wait happens.** In `pi -p`, JSON, and RPC modes the wait blocks inside pi's
+`agent_settled` hook, which pi awaits as part of the prompt call. That is deliberate: it keeps
+those runs alive for the whole wait instead of letting them exit on the rate-limit error.
+
+In the TUI it must not block, and that is not a matter of taste. The interactive main loop is
+`await getUserInput()` → `await session.prompt()`, and it only accepts keyboard submissions
+while parked on the first half. Blocking inside `agent_settled` keeps it parked on the second
+half, where pi has already cleared its "streaming" flag — so submitted text takes neither the
+streaming path (which dispatches extension commands immediately) nor the idle path, and is
+silently pushed onto a pending-input queue that is not drained until the wait ends. The
+symptom is `/retry-limit now`, `/retry-limit cancel`, and every other command doing nothing
+at all for the whole countdown and then all firing at once. So in the TUI the countdown runs
+on a timer, `agent_settled` returns immediately, and the resume is injected with
+`pi.sendMessage(..., { triggerTurn: true })` when the window reopens. Override with
+`waitMode`.
 
 **Context hygiene.** A failed turn stays in the transcript for history, but replaying it to the
 provider is at best noise and at worst a hard 400 (an assistant message with empty content, or
@@ -106,6 +127,7 @@ Durations accept milliseconds or a string (`"90s"`, `"15m"`, `"2h"`, `"1h30m"`).
   "retryOnQuotaExhausted": false,// also wait out exhausted credit/billing quota
   "pruneErrorMessages": true,    // drop failed turns from the resumed request
   "observeResponses": true,      // wrap fetch to recover rate-limit headers
+  "waitMode": "auto",            // auto | detached | blocking; see "Where the wait happens"
   "showResumeMessage": true,     // show the resume message in the transcript
   "notify": true,                // status notifications (errors are always shown)
   "resumePrompt": "..."          // the message used to restart the work
@@ -116,8 +138,8 @@ Environment overrides use the same names: `PI_RETRY_LIMIT_ENABLED`,
 `PI_RETRY_LIMIT_MAX_ATTEMPTS`, `PI_RETRY_LIMIT_MIN_WAIT`, `PI_RETRY_LIMIT_MAX_WAIT`,
 `PI_RETRY_LIMIT_PADDING`, `PI_RETRY_LIMIT_FALLBACK_WAIT`, `PI_RETRY_LIMIT_FALLBACK_FACTOR`,
 `PI_RETRY_LIMIT_FALLBACK_MAX_WAIT`, `PI_RETRY_LIMIT_QUOTA`, `PI_RETRY_LIMIT_PRUNE_ERRORS`,
-`PI_RETRY_LIMIT_OBSERVE_RESPONSES`, `PI_RETRY_LIMIT_SHOW_RESUME`, `PI_RETRY_LIMIT_NOTIFY`,
-`PI_RETRY_LIMIT_PROMPT`.
+`PI_RETRY_LIMIT_OBSERVE_RESPONSES`, `PI_RETRY_LIMIT_WAIT_MODE`, `PI_RETRY_LIMIT_SHOW_RESUME`,
+`PI_RETRY_LIMIT_NOTIFY`, `PI_RETRY_LIMIT_PROMPT`.
 
 ### Interaction with pi's own retry
 
@@ -134,29 +156,36 @@ request and can block on a rate limit before pi — and therefore this extension
 ```bash
 npm install
 npm run typecheck   # tsc against the real pi type definitions
-npm test            # unit tests for classification, header/prose parsing, wait planning
+npm test            # classification, header/prose parsing, wait planning, wait mode
 npm run test:e2e    # runs the real `pi` binary against a fake 429 endpoint
 ```
+
+`test/wait-mode.test.ts` drives the extension against a fake extension host and asserts the
+thing that is easy to break by accident: that `agent_settled` returns immediately in the TUI,
+that `/retry-limit now` and `cancel` work *during* a countdown, and that non-TUI modes still
+block.
 
 The end-to-end suite starts a local Anthropic-compatible server that returns 429 for the first
 N requests, then runs `pi -p` with the extension loaded and asserts the exit code, the number
 of provider requests, and the elapsed time:
 
 ```
-PASS  retry-after header             2 request(s), 9.9s, exit 0
-PASS  two consecutive limits         3 request(s), 11.3s, exit 0
-PASS  delay parsed from error text   2 request(s), 9.4s, exit 0
-PASS  exhausted quota is not retried 1 request(s), 1.0s, exit 1
+PASS  retry-after header             2 request(s), 8.8s, exit 0
+PASS  two consecutive limits         3 request(s), 10.7s, exit 0
+PASS  delay parsed from error text   2 request(s), 8.7s, exit 0
+PASS  chatgpt usage limit            2 request(s), 8.7s, exit 0
+PASS  chatgpt session limit          2 request(s), 10.8s, exit 0
+PASS  exhausted quota is not retried 1 request(s), 0.4s, exit 1
 ```
 
 ## Layout
 
 ```
-extensions/retry-limit.ts   hooks, countdown UI, commands, the wait/resume loop
+extensions/retry-limit.ts   hooks, countdown UI, commands, the wait/resume drivers
 src/detect.ts               error classification, header and prose reset parsing
 src/plan.ts                 reset hint + config -> a concrete wait
 src/config.ts               layered configuration
 src/duration.ts             duration parsing and formatting
 src/response-observer.ts    fetch wrapper that recovers rate-limit headers
-test/                       unit tests, e2e harness, fake provider extension
+test/                       unit tests, fake extension host, e2e harness, fake provider
 ```

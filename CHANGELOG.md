@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-01
+
+### Fixed
+
+- **Commands were dead during a wait.** `/retry-limit now`, `/retry-limit cancel`, and every
+  other command did nothing for the whole countdown, then fired all at once when it ended.
+  The wait blocked inside `agent_settled`, which pi awaits as part of the prompt call, so the
+  interactive main loop never returned to `getUserInput()` and submitted text was queued
+  rather than dispatched. In the TUI the countdown now runs on a timer and `agent_settled`
+  returns immediately; `pi -p`, JSON, and RPC modes still block, since that is what keeps
+  them alive. Force either with the new `waitMode` option.
+- Decimal delays were truncated to their integer part (`"in 1.5 hours"` was read as one
+  hour), because the decimal point was treated as the end of the sentence.
+- The countdown no longer arms a single long `setTimeout`, which fires immediately past
+  2^31-1 ms — reachable from a seven-day reset header.
+
+### Added
+
+- ChatGPT/Codex and Claude subscription wording is now recognised. Previously
+  `You've hit your session limit · resets 11:30pm (Europe/Istanbul)` was not classified as a
+  limit at all, and `Try again in ~109 min` produced no reset time, so the run fell back to
+  blind polling. Newly understood:
+  - `session limit`, `5h limit`, `plan limit`, `hit your … limit`, `used up your … limit`,
+    and `limit has been reached`
+  - hedged delays: `~109 min`, `about 5 minutes`, `roughly`, `around`, `under`, `up to`
+  - preposition-less resets: `resets 11:30pm`, `resets in 1 hour 49 minutes`
+  - hour-only clock times: `will reset at 3pm`
+  - `today`/`tomorrow` qualifiers
+- Trailing IANA timezones (`(Europe/Istanbul)`) are resolved in that zone rather than being
+  read as local time, including across DST boundaries. A non-timezone parenthetical such as
+  `(plus plan)` is ignored.
+- `waitMode` config option (`auto`, `detached`, `blocking`) and `PI_RETRY_LIMIT_WAIT_MODE`.
+- `/retry-limit status` reports the remaining wait and the active `waitMode`.
+
 ## [0.1.0] - 2026-08-31
 
 First release.
@@ -29,4 +63,5 @@ First release.
 - Failed turns are pruned from the resumed request, so a retried run does not replay an
   empty assistant message or an orphaned tool call to the provider.
 
+[0.2.0]: https://github.com/uzunkonak/pi_retry/releases/tag/v0.2.0
 [0.1.0]: https://github.com/uzunkonak/pi_retry/releases/tag/v0.1.0

@@ -24,7 +24,7 @@ pi -e npm:@uzunkonak/pi_retry
 ## Use
 
 It works with no configuration. When a run hits a rate limit you get a countdown; press
-<kbd>Esc</kbd> to cancel it.
+<kbd>Esc</kbd> to cancel it. The editor and every command stay live while it counts down.
 
 ```bash
 /retry-limit           # status and current configuration
@@ -32,6 +32,10 @@ It works with no configuration. When a run hits a rate limit you get a countdown
 /retry-limit now       # skip the wait and resume immediately
 /retry-limit wait 5m   # change the fallback wait interval
 ```
+
+Consumer subscription wording is understood as well as API rate-limit errors —
+`Try again in ~109 min`, `resets 11:30pm (Europe/Istanbul)`, `will reset at 3pm` — including
+the timezone, so the countdown is right even when it is not your own.
 
 Exhausted credit or billing quota is not retried — that needs a human, so the extension stops
 and says so rather than sleeping until the end of the month.

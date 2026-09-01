@@ -1,6 +1,6 @@
 {
 	"name": "@uzunkonak/pi_retry",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"description": "Pi extension that waits out provider rate limits and resumes the interrupted run once the limit window resets",
 	"type": "module",
 	"license": "MIT",
@@ -41,7 +41,7 @@
 	},
 	"scripts": {
 		"check": "tsc -p tsconfig.json && npm test",
-		"test": "node --test \"test/*.test.ts\"",
+		"test": "node --test --test-timeout=30000 \"test/*.test.ts\"",
 		"test:e2e": "node test/e2e.mjs",
 		"typecheck": "tsc -p tsconfig.json"
 	},
