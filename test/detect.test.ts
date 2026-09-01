@@ -20,6 +20,20 @@ test("classifies resetting windows as rate limits", () => {
 	}
 });
 
+test("classifies ChatGPT and Codex subscription wording as rate limits", () => {
+	const messages = [
+		"You have hit your ChatGPT usage limit (plus plan). Try again in ~109 min.",
+		"Auto-compaction failed: Summarization failed: Codex error: The usage limit has been reached.",
+		"You've hit your session limit \u00b7 resets 11:30pm (Europe/Istanbul)",
+		"You've hit your 5h limit \u00b7 resets 14:32",
+		"You've used up your weekly limit. Resets in 1 hour 49 minutes.",
+		"Claude usage limit reached. Your limit will reset at 3pm (Europe/Istanbul).",
+	];
+	for (const message of messages) {
+		assert.equal(classifyLimitError(message)?.kind, "rate-limit", message);
+	}
+});
+
 test("classifies exhausted credit as quota, not a window", () => {
 	const messages = [
 		"insufficient_quota: You exceeded your current quota, please check your plan and billing details",
@@ -103,6 +117,54 @@ test("resolves a bare wall-clock reset to its next occurrence", () => {
 	assert.equal(target.getHours(), 15);
 	assert.equal(target.getMinutes(), 0);
 	assert.ok(hint.at > midday, "must be in the future");
+});
+
+test("reads approximate delays, the ChatGPT house style", () => {
+	const cases: [string, number][] = [
+		["You have hit your ChatGPT usage limit (plus plan). Try again in ~109 min.", NOW + 109 * 60_000],
+		["Rate limited. Try again in about 5 minutes.", NOW + 300_000],
+		["Please wait approximately 90 seconds before retrying.", NOW + 90_000],
+		["You've used up your weekly limit. Resets in 1 hour 49 minutes.", NOW + 109 * 60_000],
+	];
+	for (const [message, expected] of cases) {
+		assert.equal(resetFromMessage(message, NOW)?.at, expected, message);
+	}
+});
+
+test("reads a preposition-less reset with an IANA timezone", () => {
+	// 12:00 UTC. 11:30pm in Istanbul (UTC+3) is 20:30 UTC the same day.
+	const hint = resetFromMessage("You've hit your session limit \u00b7 resets 11:30pm (Europe/Istanbul)", NOW);
+	assert.equal(hint?.at, Date.parse("2026-08-31T20:30:00.000Z"));
+	assert.equal(hint?.source, "message:resets-at");
+});
+
+test("rolls a reset that already passed today into tomorrow, in the stated zone", () => {
+	// 09:00 UTC is 12:00 in Istanbul, so 10:00 there is already gone.
+	const morning = Date.parse("2026-08-31T09:00:00.000Z");
+	const hint = resetFromMessage("Limit reached, resets 10:00 (Europe/Istanbul)", morning);
+	assert.equal(hint?.at, Date.parse("2026-09-01T07:00:00.000Z"));
+});
+
+test("reads an hour-only reset and honours an explicit day", () => {
+	assert.equal(
+		resetFromMessage("Claude usage limit reached. Your limit will reset at 3pm (Europe/Istanbul).", NOW)?.at,
+		// 15:00 Istanbul is 12:00 UTC, i.e. exactly NOW, so it must roll to tomorrow.
+		Date.parse("2026-09-01T12:00:00.000Z"),
+	);
+	assert.equal(
+		resetFromMessage("Your limit resets tomorrow at 9am (Europe/Istanbul).", NOW)?.at,
+		Date.parse("2026-09-01T06:00:00.000Z"),
+	);
+});
+
+test("ignores a parenthetical that is not a timezone", () => {
+	const hint = resetFromMessage("Usage limit reached. Resets at 2026-08-31T12:45:00Z (plus plan)", NOW);
+	assert.equal(hint?.at, Date.parse("2026-08-31T12:45:00.000Z"));
+});
+
+test("does not read a bare hour as a clock time", () => {
+	// "reset 5 times today" must not become 05:00.
+	assert.equal(resetFromMessage("The connection was reset 5 times", NOW), undefined);
 });
 
 test("returns nothing when the error text has no timing", () => {

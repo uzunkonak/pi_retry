@@ -48,9 +48,39 @@ export interface ProviderResponse {
 const QUOTA_PATTERN =
 	/insufficient_quota|quota exceeded|exceeded your quota|out of (?:budget|credit)|available balance|credit balance|billing|payment required|GoUsageLimitError|FreeUsageLimitError|monthly usage limit/i;
 
-/** Throttles and rolling usage windows that reopen without intervention. */
-const RATE_LIMIT_PATTERN =
-	/rate.?limit|ratelimit|too many requests|\b429\b|resource.?exhausted|usage limit|limit reached|limit exceeded|limit will reset|weekly limit|daily limit|hourly limit|premium request|throttl|server requested \d+(?:\.\d+)?s retry delay|retry.?after|slow down/i;
+/**
+ * Throttles and rolling usage windows that reopen without intervention.
+ *
+ * The `hit your … limit` and `<window> limit` alternatives cover the
+ * subscription wording used by ChatGPT/Codex and Claude, which never says
+ * "rate limit": "You have hit your ChatGPT usage limit (plus plan)",
+ * "You've hit your session limit", "You've hit your 5h limit".
+ */
+const RATE_LIMIT_PATTERN = new RegExp(
+	[
+		"rate.?limit",
+		"ratelimit",
+		"too many requests",
+		"\\b429\\b",
+		"resource.?exhausted",
+		// "usage limit", "session limit", "weekly limit", "5h limit", "5-hour limit".
+		"\\b(?:usage|session|context window|weekly|daily|hourly|\\d+\\s*-?\\s*(?:h|hr|hour)s?|five.hour|plan|model|message|token|request)\\s+limit\\b",
+		// "You have hit your ChatGPT usage limit", "You've hit your limit".
+		"hit your(?:[^.]{0,40}?)?\\blimit\\b",
+		"used up your[^.]{0,40}?\\blimit\\b",
+		// "limit reached", "limit has been reached", "limit is reached".
+		"limit (?:(?:has|have|had|is|was|been)\\s+)*reached",
+		"limit exceeded",
+		"limit will reset",
+		"limit resets",
+		"premium request",
+		"throttl",
+		"server requested \\d+(?:\\.\\d+)?s retry delay",
+		"retry.?after",
+		"slow down",
+	].join("|"),
+	"i",
+);
 
 /**
  * Decide whether a failed assistant message is a limit we can wait out.
@@ -169,52 +199,100 @@ function normalizeHeaders(headers: Record<string, string>): Map<string, string> 
 }
 
 /**
- * Prose patterns, most specific first. Each capture is handed to a reader that
- * turns it into an instant; the first reader that succeeds wins.
+ * Hedges providers put in front of a duration: ChatGPT reports "Try again in
+ * ~109 min", others say "in about 5 minutes" or "in less than a minute".
  */
-const MESSAGE_RULES: { pattern: RegExp; read: (match: RegExpExecArray, now: number) => number | undefined }[] = [
+const APPROX = String.raw`(?:[~≈<]|about|approx(?:\.|imately)?|roughly|around|nearly|almost|under|less than|up to|at least)?\s*`;
+
+/**
+ * A duration capture. Stops at sentence punctuation or at the separators
+ * providers use to append the next fact ("·", "|").
+ *
+ * The stop character must not be followed by a digit, so the decimal point in
+ * "~0.1 min" or "1.5 hours" is not mistaken for the end of the sentence — which
+ * would silently truncate the delay to its integer part. Everything else still
+ * terminates the capture, including the quote-and-brace tail of a delay quoted
+ * inside a JSON error body.
+ */
+const DURATION = String.raw`(\d[\d.\s a-z]*?)(?=[.,;:)\]·|](?!\d)|\bbefore\b|$)`;
+
+/** A "when" capture. Parentheses are kept so a trailing `(Europe/Istanbul)` survives. */
+const WHEN = String.raw`([^.,;\]·|]+)`;
+
+/**
+ * Prose patterns, most specific first. Each capture is handed to a reader that
+ * turns it into an instant; the first reader that succeeds wins. Rules that
+ * capture something unparseable fall through to the next rule.
+ */
+const MESSAGE_RULES: {
+	id: string;
+	pattern: RegExp;
+	read: (match: RegExpExecArray, now: number) => number | undefined;
+}[] = [
 	// Pi's own guard when a provider asks for a longer delay than it will honour:
 	// "Server requested 3600s retry delay (max: 60s)."
 	{
+		id: "server-requested-delay",
 		pattern: /server requested\s+(\d+(?:\.\d+)?)\s*s(?:econds)?\s+retry delay/i,
 		read: (m, now) => now + Number.parseFloat(m[1]) * 1000,
 	},
 	// Google: `"retryDelay": "34s"`.
 	{
+		id: "retry-delay-field",
 		pattern: /retry_?delay["'\s:=]+(\d+(?:\.\d+)?)\s*s/i,
 		read: (m, now) => now + Number.parseFloat(m[1]) * 1000,
 	},
 	// Explicit epoch in a JSON error body: "resets_at": 1735660800.
 	{
+		id: "resets-at-epoch",
 		pattern: /reset(?:s)?_?(?:at|time)?["'\s:=]+(\d{10,13})\b/i,
 		read: (m) => {
 			const n = Number.parseInt(m[1], 10);
 			return n >= 1e12 ? n : n * 1000;
 		},
 	},
-	// "retry in 4m12s", "try again after 30 seconds".
+	// "resets in 1h 49m" — must be tried before the bare "resets <when>" rule below,
+	// which would otherwise read "in 1h 49m" as a clock time and fail.
 	{
-		pattern: /(?:retry|try again|retrying)\s+(?:again\s+)?(?:in|after)\s+([\d][\d.\s a-z]*?)(?=[.,;:)\]]|\bbefore\b|$)/i,
+		id: "resets-in",
+		pattern: new RegExp(String.raw`reset(?:s|ting)?\s+in\s+${APPROX}${DURATION}`, "i"),
+		read: (m, now) => addDuration(m[1], now),
+	},
+	// "retry in 4m12s", "try again after 30 seconds", "Try again in ~109 min".
+	{
+		id: "try-again-in",
+		pattern: new RegExp(
+			String.raw`(?:retry|try again|retrying)\s+(?:again\s+)?(?:in|after)\s+${APPROX}${DURATION}`,
+			"i",
+		),
 		read: (m, now) => addDuration(m[1], now),
 	},
 	// "please wait 5 minutes before retrying".
 	{
-		pattern: /wait\s+(?:for\s+)?([\d][\d.\s a-z]*?)(?=[.,;:)\]]|\bbefore\b|$)/i,
+		id: "wait-for",
+		pattern: new RegExp(String.raw`wait\s+(?:for\s+)?${APPROX}${DURATION}`, "i"),
 		read: (m, now) => addDuration(m[1], now),
 	},
-	// "your limit will reset at 3:00 PM", "resets on 2026-08-31T15:00:00Z".
+	// "your limit will reset at 3:00 PM", "resets on 2026-08-31T15:00:00Z", and the
+	// preposition-less ChatGPT form "resets 11:30pm (Europe/Istanbul)".
 	{
-		pattern: /(?:will\s+)?reset(?:s|ting)?\s+(?:at|on)\s+([^.,;)\]]+)/i,
+		id: "resets-at",
+		pattern: new RegExp(String.raw`(?:will\s+)?reset(?:s|ting)?\s+(?:at\s+|on\s+)?${WHEN}`, "i"),
 		read: (m, now) => parseWhen(m[1], now),
 	},
 	// "available again at 18:00".
 	{
-		pattern: /available\s+(?:again\s+)?(?:at|on)\s+([^.,;)\]]+)/i,
+		id: "available-at",
+		pattern: new RegExp(String.raw`available\s+(?:again\s+)?(?:at|on)\s+${WHEN}`, "i"),
 		read: (m, now) => parseWhen(m[1], now),
 	},
 	// Last resort: a bare "in 45 seconds" anywhere in the text.
 	{
-		pattern: /\bin\s+(\d+(?:\.\d+)?\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))\b/i,
+		id: "bare-in",
+		pattern: new RegExp(
+			String.raw`\bin\s+${APPROX}(\d+(?:\.\d+)?\s*(?:seconds?|secs?|minutes?|mins?|hours?|hrs?))\b`,
+			"i",
+		),
 		read: (m, now) => addDuration(m[1], now),
 	},
 ];
@@ -229,7 +307,7 @@ export function resetFromMessage(errorMessage: string | undefined, now: number):
 		const at = rule.read(match, now);
 		if (at === undefined || Number.isNaN(at)) continue;
 		if (at > now + MAX_HORIZON_MS) continue;
-		return { at, source: `message:${rule.pattern.source.slice(0, 24)}` };
+		return { at, source: `message:${rule.id}` };
 	}
 	return undefined;
 }
@@ -241,33 +319,156 @@ function addDuration(text: string, now: number): number | undefined {
 
 /**
  * Read a captured "when" phrase: an absolute date, or a bare wall-clock time
- * such as "3:00 PM" which providers print without a date. A bare clock time is
- * resolved to its next occurrence in local time.
+ * such as "3:00 PM" or "11:30pm (Europe/Istanbul)" which providers print
+ * without a date. A bare clock time resolves to its next occurrence, in the
+ * stated timezone when there is one and in local time otherwise.
  */
 function parseWhen(text: string, now: number): number | undefined {
-	const value = text.trim().replace(/\s+/g, " ");
+	const { value, zone } = splitZone(text.trim().replace(/\s+/g, " "));
 	if (value.length === 0) return undefined;
 
-	const clock = /^(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(am|pm)?\b/i.exec(value);
-	if (clock && !/\d{4}/.test(value)) return nextClockTime(clock, now);
+	// A four-digit run means a real date ("2026-08-31", "Aug 31 2026"), not a clock.
+	if (!/\d{4}/.test(value)) {
+		const clock = CLOCK_PATTERN.exec(value);
+		if (clock) return nextClockTime(clock, now, zone);
+	}
 
-	const parsed = Date.parse(value);
+	const parsed = Date.parse(zone && !/\b(?:[+-]\d{2}:?\d{2}|Z|GMT|UTC)\b/.test(value) ? `${value} ${zone}` : value);
 	return Number.isNaN(parsed) ? undefined : parsed;
 }
 
-function nextClockTime(clock: RegExpExecArray, now: number): number {
-	let hours = Number.parseInt(clock[1], 10);
-	const minutes = Number.parseInt(clock[2], 10);
-	const seconds = clock[3] ? Number.parseInt(clock[3], 10) : 0;
-	const meridiem = clock[4]?.toLowerCase();
+/**
+ * Wall-clock times, with the date-relative words providers use around them:
+ * "11:30pm", "3:00 PM", "tomorrow at 9am", "14:32:00". An hour on its own is
+ * only accepted with a meridiem, so a bare number is never mistaken for a time.
+ */
+const CLOCK_PATTERN = /^(?:(today|tomorrow)\s+)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?(?::(\d{2}))?\s*(am|pm)?\b/i;
+
+function nextClockTime(clock: RegExpExecArray, now: number, zone: string | undefined): number | undefined {
+	const [, dayWord, rawHours, rawMinutes, rawSeconds, rawMeridiem] = clock;
+	const meridiem = rawMeridiem?.toLowerCase();
+	if (rawMinutes === undefined && meridiem === undefined) return undefined;
+
+	let hours = Number.parseInt(rawHours, 10);
+	if (hours > 23) return undefined;
+	const minutes = rawMinutes ? Number.parseInt(rawMinutes, 10) : 0;
+	const seconds = rawSeconds ? Number.parseInt(rawSeconds, 10) : 0;
+	if (minutes > 59 || seconds > 59) return undefined;
 
 	if (meridiem === "pm" && hours < 12) hours += 12;
 	if (meridiem === "am" && hours === 12) hours = 0;
 
+	const tomorrow = dayWord?.toLowerCase() === "tomorrow";
+
+	if (zone) {
+		const today = wallClockDate(zone, now);
+		let at = zonedTimeToEpoch(zone, today.year, today.month, today.day + (tomorrow ? 1 : 0), hours, minutes, seconds);
+		// A window that already reopened today must mean tomorrow's occurrence.
+		if (at <= now && !dayWord) {
+			at = zonedTimeToEpoch(zone, today.year, today.month, today.day + 1, hours, minutes, seconds);
+		}
+		return at;
+	}
+
 	const target = new Date(now);
+	if (tomorrow) target.setDate(target.getDate() + 1);
 	target.setHours(hours, minutes, seconds, 0);
-	if (target.getTime() <= now) target.setDate(target.getDate() + 1);
+	if (target.getTime() <= now && !dayWord) target.setDate(target.getDate() + 1);
 	return target.getTime();
+}
+
+/**
+ * Separate a trailing timezone from the time itself. Providers append it either
+ * parenthesised ("11:30pm (Europe/Istanbul)") or bare ("11:30pm Europe/Istanbul").
+ * A parenthetical that is not a timezone — "(plus plan)" — is simply dropped.
+ */
+function splitZone(text: string): { value: string; zone?: string } {
+	const paren = /\s*\(([^)]*)\)\s*$/.exec(text);
+	if (paren) {
+		const candidate = paren[1].trim();
+		const head = text.slice(0, paren.index).trim();
+		return isTimeZone(candidate) ? { value: head, zone: candidate } : { value: head };
+	}
+
+	const bare = /\s+([A-Za-z_]+(?:\/[A-Za-z_0-9+-]+)+)\s*$/.exec(text);
+	if (bare && isTimeZone(bare[1])) return { value: text.slice(0, bare.index).trim(), zone: bare[1] };
+
+	return { value: text };
+}
+
+function isTimeZone(candidate: string): boolean {
+	if (!/^[A-Za-z_]+(?:\/[A-Za-z_0-9+-]+)*$/.test(candidate)) return false;
+	try {
+		new Intl.DateTimeFormat("en-US", { timeZone: candidate });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+interface WallClockDate {
+	year: number;
+	month: number;
+	day: number;
+}
+
+const ZONE_FORMATTERS = new Map<string, Intl.DateTimeFormat>();
+
+function zoneFormatter(zone: string): Intl.DateTimeFormat {
+	let formatter = ZONE_FORMATTERS.get(zone);
+	if (!formatter) {
+		formatter = new Intl.DateTimeFormat("en-US", {
+			timeZone: zone,
+			hourCycle: "h23",
+			year: "numeric",
+			month: "2-digit",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+			second: "2-digit",
+		});
+		ZONE_FORMATTERS.set(zone, formatter);
+	}
+	return formatter;
+}
+
+function wallClockDate(zone: string, epoch: number): WallClockDate {
+	const parts = zonePartsOf(zone, epoch);
+	return { year: parts[0], month: parts[1], day: parts[2] };
+}
+
+function zonePartsOf(zone: string, epoch: number): [number, number, number, number, number, number] {
+	const parts = zoneFormatter(zone).formatToParts(new Date(epoch));
+	const read = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((part) => part.type === type)?.value);
+	// `hourCycle: "h23"` still reports midnight as 24 in some ICU builds.
+	const hour = read("hour") % 24;
+	return [read("year"), read("month"), read("day"), hour, read("minute"), read("second")];
+}
+
+/** Milliseconds to add to a UTC instant to get the wall clock in `zone`. */
+function zoneOffset(zone: string, epoch: number): number {
+	const [year, month, day, hour, minute, second] = zonePartsOf(zone, epoch);
+	return Date.UTC(year, month - 1, day, hour, minute, second) - epoch;
+}
+
+/**
+ * Convert a wall-clock time in `zone` to an epoch. Two passes because the
+ * offset used to undo the conversion is itself offset-dependent around DST
+ * transitions; the second pass settles it. Out-of-range day numbers roll over,
+ * so `day + 1` on the last of the month is safe.
+ */
+function zonedTimeToEpoch(
+	zone: string,
+	year: number,
+	month: number,
+	day: number,
+	hours: number,
+	minutes: number,
+	seconds: number,
+): number {
+	const asUTC = Date.UTC(year, month - 1, day, hours, minutes, seconds);
+	const first = asUTC - zoneOffset(zone, asUTC);
+	return asUTC - zoneOffset(zone, first);
 }
 
 /**

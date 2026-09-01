@@ -33,7 +33,40 @@ const FAILURES = {
 		type: "error",
 		error: { type: "rate_limit_error", message: "Rate limit reached. Please try again in 6s." },
 	},
+	/** ChatGPT/Codex subscription wording: no "rate limit", hedged delay. */
+	chatgptApprox: {
+		type: "error",
+		error: {
+			type: "usage_limit_error",
+			message: "You have hit your ChatGPT usage limit (plus plan). Try again in ~0.1 min.",
+		},
+	},
+	/**
+	 * ChatGPT/Codex session wording: preposition-less reset with a timezone.
+	 * Built per request, since it names a wall-clock instant relative to now.
+	 */
+	chatgptSession: () => ({
+		type: "error",
+		error: { type: "usage_limit_error", message: `You've hit your session limit \u00b7 resets ${resetClock(8)}` },
+	}),
 };
+
+/**
+ * A wall-clock reset string `seconds` from now, as ChatGPT prints it but with
+ * seconds included so the scenario has a precise deadline. Exercises the same
+ * timezone-aware path as the minute-precision form users actually see.
+ */
+function resetClock(seconds) {
+	const zone = "Europe/Istanbul";
+	const clock = new Intl.DateTimeFormat("en-GB", {
+		timeZone: zone,
+		hourCycle: "h23",
+		hour: "2-digit",
+		minute: "2-digit",
+		second: "2-digit",
+	}).format(new Date(Date.now() + seconds * 1000));
+	return `${clock} (${zone})`;
+}
 
 const SCENARIOS = [
 	{
@@ -58,6 +91,22 @@ const SCENARIOS = [
 		expect: { code: 0, answer: true, requests: 2, minSeconds: 6, maxSeconds: 20 },
 	},
 	{
+		// "~0.1 min" is 6s; the point is that the tilde, the decimal, and the absent
+		// words "rate limit" do not stop it being recognised.
+		name: "chatgpt usage limit",
+		failures: 1,
+		body: FAILURES.chatgptApprox,
+		headers: {},
+		expect: { code: 0, answer: true, requests: 2, minSeconds: 5, maxSeconds: 20 },
+	},
+	{
+		name: "chatgpt session limit",
+		failures: 1,
+		body: FAILURES.chatgptSession,
+		headers: {},
+		expect: { code: 0, answer: true, requests: 2, minSeconds: 7, maxSeconds: 25 },
+	},
+	{
 		name: "exhausted quota is not retried",
 		failures: 99,
 		body: FAILURES.quota,
@@ -76,7 +125,7 @@ async function startServer(scenario) {
 
 			if (index < scenario.failures) {
 				res.writeHead(429, { "content-type": "application/json", ...scenario.headers });
-				res.end(JSON.stringify(scenario.body));
+				res.end(JSON.stringify(typeof scenario.body === "function" ? scenario.body() : scenario.body));
 				return;
 			}
 			res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -144,6 +193,9 @@ async function runScenario(scenario) {
 			"--no-session",
 			"--offline",
 			"--approve",
+			// Discovery off, so an installed copy of this same extension cannot collide
+			// with the checkout under test. Explicit -e paths still load.
+			"--no-extensions",
 			"-e",
 			join(projectRoot, "test", "fake-provider.ts"),
 			"-e",
