@@ -13,6 +13,10 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseDuration } from "./duration.ts";
 
+export type WaitMode = "auto" | "detached" | "blocking";
+
+const WAIT_MODES: WaitMode[] = ["auto", "detached", "blocking"];
+
 export interface RetryLimitConfig {
 	/** Master switch. */
 	enabled: boolean;
@@ -36,6 +40,14 @@ export interface RetryLimitConfig {
 	pruneErrorMessages: boolean;
 	/** Wrap `globalThis.fetch` to recover rate-limit headers pi's hook cannot see. */
 	observeResponses: boolean;
+	/**
+	 * How the wait is held.
+	 *   `auto`      detached in the TUI, blocking everywhere else (recommended)
+	 *   `detached`  never hold pi's prompt call open
+	 *   `blocking`  always hold it open
+	 * See the extension for why the TUI must not be blocked.
+	 */
+	waitMode: WaitMode;
 	/** Show the resume message in the transcript instead of hiding it. */
 	showResumeMessage: boolean;
 	/** Emit `ctx.ui.notify` calls when a wait starts, is cancelled, or resumes. */
@@ -56,6 +68,7 @@ export const DEFAULT_CONFIG: RetryLimitConfig = {
 	retryOnQuotaExhausted: false,
 	pruneErrorMessages: true,
 	observeResponses: true,
+	waitMode: "auto",
 	showResumeMessage: true,
 	notify: true,
 	resumePrompt:
@@ -79,6 +92,7 @@ const FIELD_READERS: { [K in keyof RetryLimitConfig]: (raw: unknown) => RetryLim
 	retryOnQuotaExhausted: readBoolean,
 	pruneErrorMessages: readBoolean,
 	observeResponses: readBoolean,
+	waitMode: readWaitMode,
 	showResumeMessage: readBoolean,
 	notify: readBoolean,
 	resumePrompt: readString,
@@ -105,6 +119,7 @@ const ENV_KEYS: Record<string, keyof RetryLimitConfig> = {
 	PI_RETRY_LIMIT_QUOTA: "retryOnQuotaExhausted",
 	PI_RETRY_LIMIT_PRUNE_ERRORS: "pruneErrorMessages",
 	PI_RETRY_LIMIT_OBSERVE_RESPONSES: "observeResponses",
+	PI_RETRY_LIMIT_WAIT_MODE: "waitMode",
 	PI_RETRY_LIMIT_SHOW_RESUME: "showResumeMessage",
 	PI_RETRY_LIMIT_NOTIFY: "notify",
 	PI_RETRY_LIMIT_PROMPT: "resumePrompt",
@@ -215,4 +230,10 @@ function readDuration(raw: unknown): number | undefined {
 
 function readString(raw: unknown): string | undefined {
 	return typeof raw === "string" ? raw : undefined;
+}
+
+function readWaitMode(raw: unknown): WaitMode | undefined {
+	if (typeof raw !== "string") return undefined;
+	const value = raw.trim().toLowerCase() as WaitMode;
+	return WAIT_MODES.includes(value) ? value : undefined;
 }

@@ -12,7 +12,11 @@
  * then from the provider's error text — sleeps with a live countdown, and
  * restarts the agent.
  *
- * Commands: /retry-limit [status | cancel | now | on | off]
+ * In the TUI the wait runs on a timer rather than inside the `agent_settled`
+ * handler, so the editor and every `/retry-limit` subcommand stay live for the
+ * whole countdown. See `isBlocking` for what goes wrong otherwise.
+ *
+ * Commands: /retry-limit [status | cancel | now | on | off | wait <duration>]
  * Flag:     --no-retry-limit
  * Config:   ~/.pi/agent/retry-limit.json, .pi/retry-limit.json, PI_RETRY_LIMIT_*
  */
@@ -31,6 +35,9 @@ const WIDGET_KEY = "retry-limit";
 
 /** How long to give a resumed run to actually start before declaring it stuck. */
 const RESUME_START_TIMEOUT_MS = 10_000;
+
+/** Countdown refresh interval; also the granularity at which the wait ends. */
+const TICK_MS = 1_000;
 
 interface PendingFailure {
 	kind: LimitKind;
@@ -57,12 +64,14 @@ export default function (pi: ExtensionAPI) {
 
 	/** Set while this extension is driving a wait/resume cycle. */
 	let driving = false;
-	/** Resolver for the `agent_settled` of a run we started ourselves. */
+	/** Resolver for the `agent_settled` of a run we started ourselves (blocking mode). */
 	let runWaiter: (() => void) | undefined;
 	/** True once the resumed run has actually begun streaming. */
 	let runStarted = false;
 	/** True while a resumed run is in flight, gating context pruning. */
 	let resuming = false;
+	/** Detached-mode guard: fires if an injected resume never starts a run. */
+	let startWatchdog: ReturnType<typeof setTimeout> | undefined;
 	let activeWait: ActiveWait | undefined;
 	let stopObserving: ObserverCleanup | undefined;
 
@@ -85,6 +94,7 @@ export default function (pi: ExtensionAPI) {
 		lastResponse = undefined;
 		pendingFailure = undefined;
 		attempt = 0;
+		clearWatchdog();
 
 		syncObserver();
 
@@ -118,6 +128,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", () => {
 		runStarted = true;
+		clearWatchdog();
 		pendingFailure = undefined;
 	});
 
@@ -153,7 +164,9 @@ export default function (pi: ExtensionAPI) {
 	// ---------------------------------------------------------------------
 
 	pi.on("agent_settled", async (_event, ctx) => {
-		// A run we started has finished; hand control back to `drive()`.
+		resuming = false;
+
+		// A run we started has finished; hand control back to `driveBlocking()`.
 		if (runWaiter) {
 			const resolve = runWaiter;
 			runWaiter = undefined;
@@ -162,59 +175,57 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (!config.enabled || driving) return;
 
-		driving = true;
-		try {
-			await drive(ctx);
-		} finally {
-			driving = false;
-			clearIndicators(ctx);
+		if (isBlocking(ctx)) {
+			driving = true;
+			try {
+				await driveBlocking(ctx);
+			} finally {
+				driving = false;
+				clearIndicators(ctx);
+			}
+			return;
 		}
+
+		// Interactive: return immediately and run the wait on a timer instead.
+		// See `isBlocking` for why holding this handler open breaks the TUI.
+		void driveDetached(ctx);
 	});
 
 	/**
-	 * Blocking on purpose: `agent_settled` is awaited inside pi's prompt call, so
-	 * holding here keeps `-p` runs and RPC callers alive for the whole wait
-	 * instead of letting them exit on the rate-limit error.
+	 * Whether to hold pi's prompt call open for the duration of the wait.
+	 *
+	 * In `-p`, JSON, and RPC modes the answer is yes: `agent_settled` is awaited
+	 * inside the prompt call, so blocking there is the only thing keeping the
+	 * process alive instead of exiting on the rate-limit error.
+	 *
+	 * In the TUI the answer is no, and this is not a matter of taste. The
+	 * interactive main loop is `await getUserInput()` → `await session.prompt()`,
+	 * and it only accepts keyboard submissions while it is parked on the first
+	 * half. Blocking inside `agent_settled` keeps it parked on the second half,
+	 * where pi has already cleared its "streaming" flag — so submitted text takes
+	 * neither the streaming path (which dispatches extension commands
+	 * immediately) nor the idle path, and is silently pushed onto a pending-input
+	 * queue that is not drained until the wait ends. The visible symptom is
+	 * `/retry-limit now`, `/retry-limit cancel`, and every other command doing
+	 * nothing at all for the entire countdown, then all firing at once.
 	 */
-	async function drive(ctx: ExtensionContext): Promise<void> {
+	function isBlocking(ctx: ExtensionContext): boolean {
+		if (config.waitMode === "blocking") return true;
+		if (config.waitMode === "detached") return false;
+		return ctx.mode !== "tui";
+	}
+
+	/**
+	 * Blocking on purpose: holding here keeps `-p` runs and RPC callers alive for
+	 * the whole wait instead of letting them exit on the rate-limit error.
+	 */
+	async function driveBlocking(ctx: ExtensionContext): Promise<void> {
 		for (;;) {
-			const failure = pendingFailure;
-			if (!failure) {
-				attempt = 0;
-				return;
-			}
-			pendingFailure = undefined;
+			const step = nextStep(ctx);
+			if (!step) return;
 
-			if (failure.kind === "quota" && !config.retryOnQuotaExhausted) {
-				report(
-					ctx,
-					`retry-limit: "${failure.matched}" looks like exhausted quota, not a resetting window — not retrying. Set retryOnQuotaExhausted to override.`,
-					"warning",
-				);
-				attempt = 0;
-				return;
-			}
-
-			if (config.maxAttempts > 0 && attempt >= config.maxAttempts) {
-				report(ctx, `retry-limit: giving up after ${attempt} attempt(s).`, "error");
-				attempt = 0;
-				return;
-			}
-
-			attempt++;
-			const now = Date.now();
-			const hint = resolveResetHint(failure.errorMessage, lastResponse, now);
-			const plan = planWait({ hint, now, attempt, config });
-
-			report(
-				ctx,
-				`retry-limit: rate limited. Resuming in ${formatDuration(plan.waitMs)} at ${formatClock(plan.resumeAt)}${
-					plan.blind ? " (no reset time from provider)" : ""
-				}.`,
-				"info",
-			);
-
-			const outcome = await sleepWithCountdown(ctx, plan, failure);
+			announce(ctx, step.plan);
+			const outcome = await sleepWithCountdown(ctx, step.plan, step.failure, true);
 			if (outcome === "abandon") {
 				report(ctx, "retry-limit: wait cancelled.", "info");
 				attempt = 0;
@@ -222,7 +233,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			clearIndicators(ctx);
-			if (!(await resumeRun(ctx, plan))) {
+			if (!(await resumeAndAwait(ctx, step.plan))) {
 				attempt = 0;
 				return;
 			}
@@ -232,13 +243,97 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/**
+	 * One wait, then a fire-and-forget resume. No loop: the resumed run settles on
+	 * its own and re-enters through `agent_settled`, which is what keeps the TUI
+	 * responsive throughout.
+	 */
+	async function driveDetached(ctx: ExtensionContext): Promise<void> {
+		driving = true;
+		try {
+			const step = nextStep(ctx);
+			if (!step) return;
+
+			announce(ctx, step.plan);
+			const outcome = await sleepWithCountdown(ctx, step.plan, step.failure, false);
+			if (outcome === "abandon") {
+				report(ctx, "retry-limit: wait cancelled.", "info");
+				attempt = 0;
+				return;
+			}
+
+			clearIndicators(ctx);
+			dispatchResume(ctx, step.plan);
+		} catch (error) {
+			report(ctx, `retry-limit: wait failed — ${errorText(error)}`, "error");
+		} finally {
+			// Released before the resumed run settles, so its `agent_settled` can
+			// start the next cycle rather than being turned away by the guard.
+			driving = false;
+			clearIndicators(ctx);
+		}
+	}
+
+	/**
+	 * Decide what to do about the failure the run ended on: nothing, or a concrete
+	 * wait. Consumes `pendingFailure` and maintains the attempt counter.
+	 */
+	function nextStep(ctx: ExtensionContext): { failure: PendingFailure; plan: WaitPlan } | undefined {
+		const failure = pendingFailure;
+		if (!failure) {
+			attempt = 0;
+			return undefined;
+		}
+		pendingFailure = undefined;
+
+		if (failure.kind === "quota" && !config.retryOnQuotaExhausted) {
+			report(
+				ctx,
+				`retry-limit: "${failure.matched}" looks like exhausted quota, not a resetting window — not retrying. Set retryOnQuotaExhausted to override.`,
+				"warning",
+			);
+			attempt = 0;
+			return undefined;
+		}
+
+		if (config.maxAttempts > 0 && attempt >= config.maxAttempts) {
+			report(ctx, `retry-limit: giving up after ${attempt} attempt(s).`, "error");
+			attempt = 0;
+			return undefined;
+		}
+
+		attempt++;
+		const now = Date.now();
+		const hint = resolveResetHint(failure.errorMessage, lastResponse, now);
+		return { failure, plan: planWait({ hint, now, attempt, config }) };
+	}
+
+	function announce(ctx: ExtensionContext, plan: WaitPlan): void {
+		report(
+			ctx,
+			`retry-limit: rate limited. Resuming in ${formatDuration(plan.waitMs)} at ${formatClock(plan.resumeAt)}${
+				plan.blind ? " (no reset time from provider)" : ""
+			}.`,
+			"info",
+		);
+	}
+
+	/**
 	 * Sleep until the window reopens, updating the footer status and an editor
 	 * widget once a second. Escape cancels, as does `/retry-limit cancel`.
+	 *
+	 * The deadline is checked on the same tick rather than armed as one long
+	 * `setTimeout`, which silently fires immediately past the 2^31-1 ms limit —
+	 * reachable from a seven-day reset header.
+	 *
+	 * `keepAlive` refs the ticker so a blocking wait holds a `-p` process open for
+	 * its whole duration. A detached wait must not: the TUI has its own reason to
+	 * live, and an extension countdown should never be what stops pi exiting.
 	 */
 	function sleepWithCountdown(
 		ctx: ExtensionContext,
 		plan: WaitPlan,
 		failure: PendingFailure,
+		keepAlive: boolean,
 	): Promise<"resume" | "abandon"> {
 		return new Promise((resolve) => {
 			let settled = false;
@@ -248,7 +343,6 @@ export default function (pi: ExtensionAPI) {
 				if (settled) return;
 				settled = true;
 				clearInterval(ticker);
-				clearTimeout(timer);
 				unsubscribe?.();
 				activeWait = undefined;
 				resolve(outcome);
@@ -269,8 +363,14 @@ export default function (pi: ExtensionAPI) {
 				]);
 			};
 
-			const timer = setTimeout(() => finish("resume"), Math.max(0, plan.resumeAt - Date.now()));
-			const ticker = setInterval(render, 1_000);
+			const ticker = setInterval(() => {
+				if (Date.now() >= plan.resumeAt) {
+					finish("resume");
+					return;
+				}
+				render();
+			}, TICK_MS);
+			if (!keepAlive) ticker.unref?.();
 			activeWait = { plan, finish };
 
 			if (ctx.mode === "tui") {
@@ -282,30 +382,67 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 			render();
+			if (Date.now() >= plan.resumeAt) finish("resume");
 		});
 	}
 
-	/**
-	 * Inject the resume message and wait for the run it triggers to settle.
-	 * Returns false when the run could not be started at all.
-	 */
-	async function resumeRun(ctx: ExtensionContext, plan: WaitPlan): Promise<boolean> {
+	/** The message that restarts the interrupted work. */
+	function sendResume(plan: WaitPlan): void {
 		runStarted = false;
 		resuming = true;
+		pi.sendMessage(
+			{
+				customType: CUSTOM_TYPE,
+				content: config.resumePrompt,
+				display: config.showResumeMessage,
+				details: { attempt, waitedMs: plan.waitMs, source: plan.source },
+			},
+			{ triggerTurn: true },
+		);
+	}
+
+	/**
+	 * Detached resume. `pi.sendMessage` is fire-and-forget, so a watchdog reports
+	 * the case where the injected message never turns into a run.
+	 */
+	function dispatchResume(ctx: ExtensionContext, plan: WaitPlan): void {
+		try {
+			sendResume(plan);
+		} catch (error) {
+			resuming = false;
+			report(ctx, `retry-limit: could not resume — ${errorText(error)}`, "error");
+			attempt = 0;
+			return;
+		}
+
+		clearWatchdog();
+		startWatchdog = setTimeout(() => {
+			startWatchdog = undefined;
+			if (runStarted) return;
+			resuming = false;
+			attempt = 0;
+			report(ctx, "retry-limit: resume did not start, stopping.", "error");
+		}, RESUME_START_TIMEOUT_MS);
+		startWatchdog.unref?.();
+	}
+
+	function clearWatchdog(): void {
+		if (startWatchdog === undefined) return;
+		clearTimeout(startWatchdog);
+		startWatchdog = undefined;
+	}
+
+	/**
+	 * Blocking resume: inject the message and wait for the run it triggers to
+	 * settle. Returns false when the run could not be started at all.
+	 */
+	async function resumeAndAwait(ctx: ExtensionContext, plan: WaitPlan): Promise<boolean> {
 		const settled = new Promise<void>((resolve) => {
 			runWaiter = resolve;
 		});
 
 		try {
-			pi.sendMessage(
-				{
-					customType: CUSTOM_TYPE,
-					content: config.resumePrompt,
-					display: config.showResumeMessage,
-					details: { attempt, waitedMs: plan.waitMs, source: plan.source },
-				},
-				{ triggerTurn: true },
-			);
+			sendResume(plan);
 		} catch (error) {
 			runWaiter = undefined;
 			resuming = false;
@@ -357,6 +494,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		activeWait?.finish("abandon");
+		clearWatchdog();
 		stopObserving?.();
 		stopObserving = undefined;
 		clearIndicators(ctx);
@@ -443,8 +581,15 @@ export default function (pi: ExtensionAPI) {
 			`attempts ${attempt}${config.maxAttempts > 0 ? `/${config.maxAttempts}` : " (unlimited)"}`,
 			`fallback ${formatDuration(config.fallbackWaitMs)}`,
 			`quota ${config.retryOnQuotaExhausted ? "retried" : "skipped"}`,
+			`waitMode ${config.waitMode}`,
 		];
-		if (activeWait) lines.push(`waiting until ${formatClock(activeWait.plan.resumeAt)} via ${activeWait.plan.source}`);
+		if (activeWait) {
+			lines.push(
+				`waiting ${formatDuration(activeWait.plan.resumeAt - Date.now())} until ${formatClock(
+					activeWait.plan.resumeAt,
+				)} via ${activeWait.plan.source}`,
+			);
+		}
 		if (warnings.length > 0) lines.push(`warnings: ${warnings.join("; ")}`);
 		return lines.join(" · ");
 	}
