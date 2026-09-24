@@ -89,6 +89,12 @@ const RATE_LIMIT_PATTERN = new RegExp(
 export function classifyLimitError(errorMessage: string | undefined): LimitClassification | undefined {
 	if (!errorMessage) return undefined;
 
+	// Request-size limits do not reopen with time. Retrying the same context
+	// indefinitely cannot recover them; leave these to pi's overflow handling.
+	if (/context[_ -](?:length|window)|maximum context|prompt (?:is )?too long/i.test(errorMessage)) {
+		return undefined;
+	}
+
 	const quota = QUOTA_PATTERN.exec(errorMessage);
 	if (quota) return { kind: "quota", matched: quota[0] };
 
@@ -142,13 +148,17 @@ const MAX_HORIZON_MS = 30 * 86_400_000;
  * at once and we cannot tell which one was hit, so retrying early and waiting
  * again beats sleeping through a seven-day header for a one-minute throttle.
  */
-export function resetFromHeaders(headers: Record<string, string>, now: number): ResetHint | undefined {
+export function resetFromHeaders(
+	headers: Record<string, string>,
+	now: number,
+	observedAt = now,
+): ResetHint | undefined {
 	const lookup = normalizeHeaders(headers);
 
 	for (const { name, unitMs } of DELAY_HEADERS) {
 		const raw = lookup.get(name);
 		if (raw === undefined) continue;
-		const at = parseInstant(raw, now, unitMs);
+		const at = parseInstant(raw, observedAt, unitMs);
 		if (at !== undefined && at <= now + MAX_HORIZON_MS) return { at, source: `header:${name}` };
 	}
 
@@ -156,7 +166,7 @@ export function resetFromHeaders(headers: Record<string, string>, now: number): 
 	for (const name of RESET_HEADERS) {
 		const raw = lookup.get(name);
 		if (raw === undefined) continue;
-		const at = parseInstant(raw, now, 1_000);
+		const at = parseInstant(raw, observedAt, 1_000);
 		if (at === undefined || at <= now || at > now + MAX_HORIZON_MS) continue;
 		if (!best || at < best.at) best = { at, source: `header:${name}` };
 	}
@@ -485,8 +495,9 @@ export function resolveResetHint(
 	now: number,
 	responseMaxAgeMs = 120_000,
 ): ResetHint | undefined {
-	if (response && isLimitStatus(response.status) && now - response.at <= responseMaxAgeMs) {
-		const fromHeaders = resetFromHeaders(response.headers, now);
+	if (response && isLimitStatus(response.status) && response.at <= now && now - response.at <= responseMaxAgeMs) {
+		// Relative headers count from receipt, not from the end of pi's retries.
+		const fromHeaders = resetFromHeaders(response.headers, now, response.at);
 		if (fromHeaders) return fromHeaders;
 	}
 	return resetFromMessage(errorMessage, now);

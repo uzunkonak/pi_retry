@@ -24,7 +24,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { type RetryLimitConfig, applyRecord, loadConfig } from "../src/config.ts";
 import { type LimitKind, type ProviderResponse, classifyLimitError, resolveResetHint } from "../src/detect.ts";
-import { formatClock, formatDuration, parseDuration } from "../src/duration.ts";
+import { formatClock, formatDuration, parseDurationStrict } from "../src/duration.ts";
 import { type WaitPlan, planWait } from "../src/plan.ts";
 import { type ObserverCleanup, observeLimitResponses } from "../src/response-observer.ts";
 
@@ -126,7 +126,13 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
+	// Never borrow a previous request's limit headers for a new request.
+	pi.on("before_provider_request", () => {
+		lastResponse = undefined;
+	});
+
 	pi.on("agent_start", () => {
+		lastResponse = undefined;
 		runStarted = true;
 		clearWatchdog();
 		pendingFailure = undefined;
@@ -546,7 +552,7 @@ export default function (pi: ExtensionAPI) {
 				}
 
 				case "wait": {
-					const parsed = parseDuration(rest.join(" "));
+					const parsed = parseDurationStrict(rest.join(" "));
 					if (parsed === undefined) {
 						ctx.ui.notify("retry-limit: usage /retry-limit wait <duration>, e.g. 5m", "warning");
 						return;
@@ -565,6 +571,9 @@ export default function (pi: ExtensionAPI) {
 					const [key, ...value] = [subcommand, ...rest];
 					const patchWarnings: string[] = [];
 					applyRecord(config, { [key]: value.join(" ") }, "command", patchWarnings);
+					if (!config.enabled) {
+						activeWait?.finish("abandon");
+					}
 					syncObserver();
 					ctx.ui.notify(
 						patchWarnings.length > 0 ? `retry-limit: ${patchWarnings.join("; ")}` : statusText(),

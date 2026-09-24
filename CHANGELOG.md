@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Context-length and context-window errors are no longer mistaken for resetting rate
+  limits, avoiding repeated waits for a request that needs a smaller context.
+- Relative reset headers count from response receipt, rather than adding the full delay
+  again after pi's own retries. Cached headers are cleared before new provider requests.
+- `/retry-limit enabled false` cancels an active countdown, just like `/retry-limit off`.
+- Invalid config/command durations (such as `-5m` or overflowing values) and invalid
+  attempt counts now produce warnings instead of silently becoming different values.
+  Provider error prose retains its permissive duration parsing.
+- Overlapping fetch observers receive responses independently; cleanup stops callbacks
+  from in-flight requests without removing another subscriber or another extension's wrapper.
+
+### Tests
+
+- Added regression coverage for configuration validation, header timing, false-positive
+  classification, countdown controls, and fetch-observer cleanup.
+- Test harness disposal now invokes extension shutdown to clean up timers and observers.
+
 ## [0.2.0] - 2026-09-01
 
 ### Fixed

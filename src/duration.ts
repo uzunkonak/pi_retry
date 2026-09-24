@@ -40,23 +40,46 @@ const DURATION_PART =
  * Returns undefined when nothing parseable is found.
  */
 export function parseDuration(input: string, bareUnitMs = 1_000): number | undefined {
-	const text = input.trim();
-	if (text.length === 0) return undefined;
+	return readDuration(input, bareUnitMs, false);
+}
 
-	if (/^\d+(\.\d+)?$/.test(text)) return Number.parseFloat(text) * bareUnitMs;
+/** Config and commands must contain only a duration, not a parseable substring. */
+export function parseDurationStrict(input: string, bareUnitMs = 1_000): number | undefined {
+	return readDuration(input, bareUnitMs, true);
+}
+
+function readDuration(input: string, bareUnitMs: number, strict: boolean): number | undefined {
+	const text = input.trim();
+	if (text.length === 0) {
+		return undefined;
+	}
+
+	if (/^\d+(\.\d+)?$/.test(text)) {
+		const value = Number(text) * bareUnitMs;
+		return Number.isFinite(value) ? value : undefined;
+	}
 
 	DURATION_PART.lastIndex = 0;
 	let total = 0;
-	let matched = false;
+	let end = 0;
 	for (;;) {
 		const part = DURATION_PART.exec(text);
-		if (!part) break;
-		const unit = UNIT_MS[part[2].toLowerCase()];
-		if (unit === undefined) continue;
-		total += Number.parseFloat(part[1]) * unit;
-		matched = true;
+		if (!part) {
+			break;
+		}
+		if (strict) {
+			const separator = text.slice(end, part.index);
+			if (!(end === 0 ? /^\s*$/ : /^(?:\s*|\s+and\s+)$/i).test(separator)) {
+				return undefined;
+			}
+		}
+		total += Number(part[1]) * UNIT_MS[part[2].toLowerCase()];
+		end = DURATION_PART.lastIndex;
 	}
-	return matched ? total : undefined;
+	if (strict && text.slice(end).trim() !== "") {
+		return undefined;
+	}
+	return end > 0 && Number.isFinite(total) ? total : undefined;
 }
 
 /** Human-readable countdown text: "38s", "4m 12s", "3h 07m", "2d 4h". */

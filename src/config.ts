@@ -11,7 +11,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { parseDuration } from "./duration.ts";
+import { parseDurationStrict } from "./duration.ts";
 
 export type WaitMode = "auto" | "detached" | "blocking";
 
@@ -82,7 +82,7 @@ const CONFIG_FILENAME = "retry-limit.json";
 /** Keys accepted in a config file, mapped to how their raw value is read. */
 const FIELD_READERS: { [K in keyof RetryLimitConfig]: (raw: unknown) => RetryLimitConfig[K] | undefined } = {
 	enabled: readBoolean,
-	maxAttempts: readNumber,
+	maxAttempts: readAttempts,
 	minWaitMs: readDuration,
 	maxWaitMs: readDuration,
 	paddingMs: readDuration,
@@ -167,13 +167,12 @@ export function applyRecord(
 	warnings: string[],
 ): void {
 	for (const [key, value] of Object.entries(raw)) {
-		const field = (FIELD_ALIASES[key] ?? key) as keyof RetryLimitConfig;
-		const reader = FIELD_READERS[field] as ((raw: unknown) => unknown) | undefined;
-		if (!reader) {
+		const field = (Object.hasOwn(FIELD_ALIASES, key) ? FIELD_ALIASES[key] : key) as keyof RetryLimitConfig;
+		if (!Object.hasOwn(FIELD_READERS, field)) {
 			warnings.push(`${origin}: unknown option "${key}"`);
 			continue;
 		}
-		const parsed = reader(value);
+		const parsed = FIELD_READERS[field](value);
 		if (parsed === undefined) {
 			warnings.push(`${origin}: could not read "${key}" from ${JSON.stringify(value)}`);
 			continue;
@@ -211,18 +210,23 @@ function readBoolean(raw: unknown): boolean | undefined {
 
 function readNumber(raw: unknown): number | undefined {
 	if (typeof raw === "number") return Number.isFinite(raw) ? raw : undefined;
-	if (typeof raw === "string") {
-		const value = Number.parseFloat(raw.trim());
+	if (typeof raw === "string" && raw.trim() !== "") {
+		const value = Number(raw.trim());
 		return Number.isFinite(value) ? value : undefined;
 	}
 	return undefined;
+}
+
+function readAttempts(raw: unknown): number | undefined {
+	const value = readNumber(raw);
+	return value !== undefined && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 }
 
 function readDuration(raw: unknown): number | undefined {
 	if (typeof raw === "number") return Number.isFinite(raw) && raw >= 0 ? raw : undefined;
 	if (typeof raw === "string") {
 		// Bare numbers in config mean milliseconds, matching the `*Ms` field names.
-		const parsed = parseDuration(raw, 1);
+		const parsed = parseDurationStrict(raw, 1);
 		return parsed !== undefined && parsed >= 0 ? parsed : undefined;
 	}
 	return undefined;

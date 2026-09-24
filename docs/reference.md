@@ -53,6 +53,8 @@ run ends on an error
 **Rate limit vs. quota.** A rate limit is a window that reopens on its own, so waiting works.
 Exhausted credit or billing quota needs a human, so the extension stops and says so rather than
 sleeping until the end of the month. Set `retryOnQuotaExhausted` if you want it to wait anyway.
+Context-length/window errors are not treated as rate limits: waiting cannot make the same
+oversized request fit, so those remain pi's responsibility.
 
 **Subscription wording.** Consumer plans rarely say "rate limit". ChatGPT/Codex reports
 `You have hit your ChatGPT usage limit (plus plan). Try again in ~109 min.` or
@@ -69,6 +71,9 @@ back, the extension installs a pass-through wrapper around `globalThis.fetch` th
 status and headers of limit-shaped responses (429/402/403/529) and changes nothing else — the
 response is returned untouched and its body is never consumed. Turn it off with
 `observeResponses: false` and the extension falls back to parsing the error text.
+Relative delays count from when the response arrived, not from when pi finishes retrying.
+Cached headers are cleared before each new provider request. Overlapping observers share
+one wrapper and unsubscribe independently; shutdown also suppresses their in-flight callbacks.
 
 **Where the wait happens.** In `pi -p`, JSON, and RPC modes the wait blocks inside pi's
 `agent_settled` hook, which pi awaits as part of the prompt call. That is deliberate: it keeps
@@ -113,6 +118,10 @@ defaults → ~/.pi/agent/retry-limit.json → <project>/.pi/retry-limit.json →
 ```
 
 Durations accept milliseconds or a string (`"90s"`, `"15m"`, `"2h"`, `"1h30m"`).
+Config and command durations must be non-negative, finite, and contain only a duration;
+invalid values such as `"-5m"` or `"5m junk"` warn and leave the previous setting unchanged.
+`maxAttempts` must be a non-negative safe integer; `0` still means unlimited.
+These checks do not restrict duration extraction from provider error prose.
 
 ```jsonc
 {
@@ -156,7 +165,7 @@ request and can block on a rate limit before pi — and therefore this extension
 ```bash
 npm install
 npm run typecheck   # tsc against the real pi type definitions
-npm test            # classification, header/prose parsing, wait planning, wait mode
+npm test            # config, classification, reset parsing, observers, wait planning/mode
 npm run test:e2e    # runs the real `pi` binary against a fake 429 endpoint
 ```
 
@@ -164,6 +173,10 @@ npm run test:e2e    # runs the real `pi` binary against a fake 429 endpoint
 thing that is easy to break by accident: that `agent_settled` returns immediately in the TUI,
 that `/retry-limit now` and `cancel` work *during* a countdown, and that non-TUI modes still
 block.
+
+`test/config.test.ts` covers config/command duration validation separately from permissive
+provider prose parsing. `test/response-observer.test.ts` checks transparent fetch forwarding,
+overlapping subscriptions, in-flight cleanup, and coexistence with another fetch wrapper.
 
 The end-to-end suite starts a local Anthropic-compatible server that returns 429 for the first
 N requests, then runs `pi -p` with the extension loaded and asserts the exit code, the number

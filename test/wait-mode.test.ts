@@ -95,6 +95,67 @@ test("/retry-limit cancel drops the pending retry", async () => {
 	}
 });
 
+test("inline enabled false cancels an active wait just like off", async () => {
+	const harness = await start("tui");
+	try {
+		await harness.fail(LONG_LIMIT);
+		await harness.emit("agent_settled");
+		assert.ok(harness.widget);
+		await harness.command("enabled false");
+		await settle();
+		assert.equal(harness.widget, undefined);
+		await harness.command("now");
+		assert.equal(harness.sent.length, 0, "a disabled countdown must not resume");
+	} finally {
+		harness.dispose();
+	}
+});
+
+test("wait command rejects negative or partially valid durations", async () => {
+	const harness = await start("tui");
+	try {
+		for (const duration of ["-5m", "1m garbage", `${"9".repeat(400)}s`]) {
+			await harness.command(`wait ${duration}`);
+			assert.match(harness.notifications.at(-1) ?? "", /usage/);
+		}
+		await harness.command("wait 1h30m");
+		assert.match(harness.notifications.at(-1) ?? "", /fallback wait set to 1h 30m/);
+	} finally {
+		harness.dispose();
+	}
+});
+
+test("new provider requests and agent runs discard earlier reset headers", async () => {
+	const harness = await start("tui");
+	try {
+		for (const event of ["before_provider_request", "agent_start"]) {
+			await harness.emit("after_provider_response", { status: 429, headers: { "retry-after": "600" } });
+			await harness.emit(event);
+			await harness.fail(LONG_LIMIT);
+			await harness.emit("agent_settled");
+			assert.match(harness.widget?.[1] ?? "", /via message:/, event);
+			await harness.command("cancel");
+			await settle();
+		}
+	} finally {
+		harness.dispose();
+	}
+});
+
+test("headers from the current request still take precedence over error prose", async () => {
+	const harness = await start("tui");
+	try {
+		await harness.emit("before_provider_request");
+		await harness.emit("after_provider_response", { status: 429, headers: { "retry-after": "600" } });
+		await harness.fail(LONG_LIMIT);
+		await harness.emit("agent_settled");
+		assert.match(harness.widget?.[1] ?? "", /via header:retry-after/);
+		await harness.command("cancel");
+	} finally {
+		harness.dispose();
+	}
+});
+
 test("Esc cancels the wait", async () => {
 	const harness = await start("tui");
 	try {
