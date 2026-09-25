@@ -51,6 +51,17 @@ test("ignores unrelated failures", () => {
 	assert.equal(classifyLimitError(undefined), undefined);
 });
 
+test("does not retry context-size limits as resetting windows", () => {
+	for (const message of [
+		"400 context window limit exceeded",
+		"context_length_exceeded: token limit exceeded",
+		"Your prompt is too long; request limit exceeded",
+		"Maximum context length exceeded",
+	]) {
+		assert.equal(classifyLimitError(message), undefined, message);
+	}
+});
+
 test("reads retry-after in seconds and as an HTTP date", () => {
 	assert.equal(resetFromHeaders({ "retry-after": "120" }, NOW)?.at, NOW + 120_000);
 	assert.equal(
@@ -181,6 +192,40 @@ test("headers are only trusted while fresh and limit-shaped", () => {
 
 	const ok = { status: 200, headers, at: NOW - 1_000 };
 	assert.equal(resolveResetHint("rate limit", ok, NOW), undefined);
+});
+
+test("relative reset headers count from receipt, not the retry decision", () => {
+	const at = NOW - 30_000;
+	const cases: Record<string, string>[] = [
+		{ "retry-after": "60" },
+		{ "retry-after-ms": "60000" },
+		{ "x-ratelimit-reset-tokens": "1m" },
+	];
+	for (const headers of cases) {
+		assert.equal(resolveResetHint("429", { status: 429, headers, at }, NOW)?.at, NOW + 30_000);
+	}
+	// An elapsed relative delay stays elapsed; the wait planner supplies its minimum.
+	assert.equal(resolveResetHint("429", { status: 429, headers: { "retry-after": "10" }, at }, NOW)?.at, NOW - 20_000);
+	assert.equal(
+		resolveResetHint("429", { status: 429, headers: { "retry-after": "Mon, 31 Aug 2026 12:05:00 GMT" }, at }, NOW)?.at,
+		NOW + 300_000,
+	);
+});
+
+test("reset windows that elapsed since receipt do not hide a future window", () => {
+	const response = {
+		status: 429,
+		at: NOW - 30_000,
+		headers: { "x-ratelimit-reset-requests": "10s", "x-ratelimit-reset-tokens": "1m" },
+	};
+	const hint = resolveResetHint("429", response, NOW);
+	assert.equal(hint?.source, "header:x-ratelimit-reset-tokens");
+	assert.equal(hint?.at, NOW + 30_000);
+});
+
+test("future-dated observations are ignored after a clock change", () => {
+	const response = { status: 429, headers: { "retry-after": "60" }, at: NOW + 1_000 };
+	assert.equal(resolveResetHint("Rate limit. Try again in 90s", response, NOW)?.at, NOW + 90_000);
 });
 
 test("headers lose to error text only when they yield nothing", () => {

@@ -11,41 +11,75 @@
 
 import { type ProviderResponse, isLimitStatus } from "./detect.ts";
 
-/** Marks our wrapper so repeated installs (e.g. `/reload`) do not nest. */
+/** Shares one wrapper across overlapping installs without dropping listeners. */
 const INSTALLED = Symbol.for("pi-retry-limit.fetch-observer");
 
 type FetchLike = typeof globalThis.fetch;
+type Listener = { record: (response: ProviderResponse) => void };
+interface ObserverState {
+	listeners: Set<Listener>;
+	restore: () => void;
+}
+type ObservedFetch = FetchLike & { [INSTALLED]?: ObserverState };
 
 export type ObserverCleanup = () => void;
 
-/**
- * Start observing. Returns a cleanup function that restores the previous fetch,
- * or a no-op when there is nothing to patch or an observer is already active.
- */
+/** Observe until cleanup, restoring fetch only after the final subscriber leaves. */
 export function observeLimitResponses(record: (response: ProviderResponse) => void): ObserverCleanup {
-	const original = globalThis.fetch;
-	if (typeof original !== "function") return () => {};
+	const original = globalThis.fetch as ObservedFetch;
+	if (typeof original !== "function") {
+		return () => {};
+	}
 
-	const marked = original as FetchLike & { [INSTALLED]?: true };
-	if (marked[INSTALLED]) return () => {};
-
-	const wrapped = (async (input, init) => {
-		const response = await original(input, init);
-		try {
-			if (isLimitStatus(response.status)) {
-				record({ status: response.status, headers: toRecord(response.headers), at: Date.now() });
+	let state = original[INSTALLED];
+	if (!state || typeof state !== "object") {
+		const listeners = new Set<Listener>();
+		const wrapped = (async function (this: unknown, ...args: Parameters<FetchLike>) {
+			// A new subscriber must not receive responses to an earlier request.
+			const recipients = [...listeners];
+			const response = await original.apply(this, args);
+			try {
+				if (isLimitStatus(response.status)) {
+					const observed = { status: response.status, headers: toRecord(response.headers), at: Date.now() };
+					for (const listener of recipients) {
+						if (!listeners.has(listener)) {
+							continue;
+						}
+						try {
+							listener.record(observed);
+						} catch {
+							// One subscriber must not break the request or another subscriber.
+						}
+					}
+				}
+			} catch {
+				// Observation must never be able to break a provider request.
 			}
-		} catch {
-			// Observation must never be able to break a provider request.
-		}
-		return response;
-	}) as FetchLike & { [INSTALLED]?: true };
+			return response;
+		}) as ObservedFetch;
+		state = {
+			listeners,
+			restore: () => {
+				// Do not overwrite a wrapper installed by another extension.
+				if (globalThis.fetch === wrapped) {
+					globalThis.fetch = original;
+				}
+			},
+		};
+		wrapped[INSTALLED] = state;
+		globalThis.fetch = wrapped;
+	}
 
-	wrapped[INSTALLED] = true;
-	globalThis.fetch = wrapped;
-
+	const listener = { record };
+	state.listeners.add(listener);
+	const subscription = state;
 	return () => {
-		if (globalThis.fetch === wrapped) globalThis.fetch = original;
+		if (!subscription.listeners.delete(listener)) {
+			return;
+		}
+		if (subscription.listeners.size === 0) {
+			subscription.restore();
+		}
 	};
 }
 

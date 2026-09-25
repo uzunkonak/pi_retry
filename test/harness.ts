@@ -116,6 +116,9 @@ export function createHarness(options: { mode: "tui" | "print"; env?: Record<str
 			return widget;
 		},
 		dispose: () => {
+			// The extension's shutdown handler cleans timers/listeners synchronously.
+			// Exercise that cleanup rather than leaking a fetch observer between tests.
+			void emit("session_shutdown");
 			for (const [key, value] of previousEnv) {
 				if (value === undefined) delete process.env[key];
 				else process.env[key] = value;
